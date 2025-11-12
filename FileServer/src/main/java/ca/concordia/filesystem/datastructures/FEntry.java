@@ -1,6 +1,7 @@
 package ca.concordia.filesystem.datastructures;
 
-import java.util.LinkedList;
+//import java.util.LinkedList;
+
 
 public class FEntry {
 
@@ -43,5 +44,9 @@ public class FEntry {
 
     public short getFirstBlock() {
         return firstBlock;
+    }
+
+    public void setFirstBlock(short firstBlock) {
+        this.firstBlock = firstBlock;
     }
 }
