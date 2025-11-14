@@ -34,7 +34,7 @@ public class FileSystemManager {
         FNODES_START = MAXFILES * FENTRY_SIZE; // FNodes start after FEntries
         DATA_START_OFFSET = METADATA_SIZE;
         
-         int minimumSize = METADATA_SIZE + (MAXBLOCKS * BLOCK_SIZE);
+        int minimumSize = METADATA_SIZE + (MAXBLOCKS * BLOCK_SIZE);
         if (totalSize < minimumSize) {
             throw new IllegalArgumentException("totalSize too small for filesystem metadata and data blocks. " +
                     "Minimum required: " + minimumSize + " bytes, but got: " + totalSize + " bytes");
@@ -150,9 +150,41 @@ public class FileSystemManager {
     
         return files;
     }
+
     public void createFile(String fileName) throws Exception {
-        // TODO
-        throw new UnsupportedOperationException("Method not implemented yet.");
+     if (fileName.length() > 11) {
+            throw new IllegalArgumentException("ERROR: filename too large");
+        }
+    
+        // Check if file already exists
+        for (FEntry entry : inodeTable) {
+            if (entry != null && fileName.equals(entry.getFilename())) {
+             throw new IllegalArgumentException("ERROR: file '" + fileName + "' already exists");
+            }
+        }
+    
+        // Find free FEntry slot
+        int freeSlot = -1;
+        for (int i = 0; i < MAXFILES; i++) {
+            if (inodeTable[i] == null || inodeTable[i].getFilename().isEmpty()) {
+                freeSlot = i;
+                break;
+            }
+        }
+    
+        if (freeSlot == -1) {
+            throw new Exception("ERROR: no free file slots available");
+        }
+    
+        // Create new FEntry
+        FEntry newEntry = new FEntry(fileName, (short)0, (short)-1);
+        inodeTable[freeSlot] = newEntry;
+    
+        // Write to disk
+        disk.seek(FENTRIES_START + (freeSlot * FENTRY_SIZE));
+        disk.write(newEntry.toBytes());
+    
+        System.out.println("Created file: '" + fileName + "' in slot " + freeSlot);
     }
 
     // TODO: Add readFile, writeFile and other required methods
