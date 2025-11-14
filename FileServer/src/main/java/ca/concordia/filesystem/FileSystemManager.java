@@ -34,18 +34,20 @@ public class FileSystemManager {
         FNODES_START = MAXFILES * FENTRY_SIZE; // FNodes start after FEntries
         DATA_START_OFFSET = METADATA_SIZE;
         
-        int minimumSize = METADATA_SIZE + (MAXBLOCKS * BLOCK_SIZE);
+        int minimumSize = METADATA_SIZE;
         if (totalSize < minimumSize) {
             throw new IllegalArgumentException("totalSize too small for filesystem metadata and data blocks. " +
                     "Minimum required: " + minimumSize + " bytes, but got: " + totalSize + " bytes");
         }
         try {
             this.disk = new RandomAccessFile(filename, "rw");
-            // Validate requested total size is sufficient for metadata + data
-            if (totalSize < (METADATA_SIZE + (MAXBLOCKS * BLOCK_SIZE))) {
-                throw new IllegalArgumentException("totalSize too small for filesystem metadata and data blocks.");
+            // recreate if old test file has wrong size
+            java.io.File f = new java.io.File(filename);
+            if (f.exists() && f.length() != totalSize) {
+                f.delete();
+                this.disk = new RandomAccessFile(filename, "rw");
+                disk.setLength(totalSize);
             }
-
             // Initialize in-memory arrays
             this.inodeTable = new FEntry[MAXFILES];
             this.fNodes = new FNode[MAXBLOCKS]; // NEW
@@ -153,15 +155,16 @@ public class FileSystemManager {
 
     public void createFile(String fileName) throws Exception {
      if (fileName.length() > 11) {
-            throw new IllegalArgumentException("ERROR: filename too large");
-        }
+    throw new IllegalArgumentException("ERROR: filename too long");
+    }
     
         // Check if file already exists
         for (FEntry entry : inodeTable) {
-            if (entry != null && fileName.equals(entry.getFilename())) {
-             throw new IllegalArgumentException("ERROR: file '" + fileName + "' already exists");
-            }
+        if (entry != null && fileName.equals(entry.getFilename())) {
+            System.out.println("File '" + fileName + "' already exists, skip create.");
+            return;
         }
+    }
     
         // Find free FEntry slot
         int freeSlot = -1;
@@ -187,5 +190,210 @@ public class FileSystemManager {
         System.out.println("Created file: '" + fileName + "' in slot " + freeSlot);
     }
 
-    // TODO: Add readFile, writeFile and other required methods
+     // find file by name in table
+    private int findSlotForFile(String name) {
+        for (int i = 0; i < MAXFILES; i++) {
+            if (inodeTable[i] != null) {
+                if (name.equals(inodeTable[i].getFilename())) {
+                    return i;
+                }
+            }
+        }
+        return -1; // not found
+    }
+
+    // get a free data block
+    private int grabFreeBlock() throws Exception {
+        for (int i = 0; i < MAXBLOCKS; i++) {
+            if (freeBlockList[i]) {
+                freeBlockList[i] = false;
+
+                // update node in memory
+                FNode n = new FNode(i);
+                n.setNext(-1);
+                fNodes[i] = n;
+
+                // and on disk
+                disk.seek(FNODES_START + i * FNODE_SIZE);
+                disk.write(n.toBytes());
+
+                return i;
+            }
+        }
+        throw new Exception("no more blocks");
+    }
+
+    // put block back in free list
+    private void giveBackBlock(int idx) throws Exception {
+        if (idx < 0 || idx >= MAXBLOCKS) {
+            return;
+        }
+
+        freeBlockList[idx] = true;
+        FNode n = new FNode(-(idx + 1));  // negative = free in this setup
+        n.setNext(-1);
+        fNodes[idx] = n;
+        disk.seek(FNODES_START + idx * FNODE_SIZE);
+        disk.write(n.toBytes());
+    }
+
+    // go through all linked blocks and free them
+    private void dropBlockChain(short start) throws Exception {
+        int curr = start;
+        while (curr >= 0) {
+            int next = fNodes[curr].getNext();
+            giveBackBlock(curr);
+            curr = next;
+        }
+    }
+
+    // write new content 
+    public void writeFile(String name, byte[] data) throws Exception {
+        globalLock.lock();
+        try {
+            int slot = findSlotForFile(name);
+            if (slot == -1) {
+                // if file doesn’t exist, just create it
+                createFile(name);
+                slot = findSlotForFile(name);
+            }
+
+            FEntry entry = inodeTable[slot];
+
+            // if file had blocks before, clear them first
+            if (entry.getFirstBlock() >= 0) {
+                dropBlockChain(entry.getFirstBlock());
+            }
+
+            // handle null data
+            if (data == null || data.length == 0) {
+                entry.setFilesize((short) 0);
+                entry.setFirstBlock((short) -1);
+
+                disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
+                disk.write(entry.toBytes());
+                return;
+            }
+
+            int left = data.length;
+            int pos = 0;
+
+            int firstBlock = -1;
+            int prevBlock = -1;
+
+            // write file chunk by chunk in 128-byte blocks
+            while (left > 0) {
+                int blk = grabFreeBlock();
+
+                if (firstBlock == -1) {
+                    firstBlock = blk;
+                }
+
+                if (prevBlock != -1) {
+                    fNodes[prevBlock].setNext(blk);
+                    disk.seek(FNODES_START + prevBlock * FNODE_SIZE);
+                    disk.write(fNodes[prevBlock].toBytes());
+                }
+
+                int chunk = left;
+                if (chunk > BLOCK_SIZE
+                ) {
+                    chunk = BLOCK_SIZE
+                    ;
+                }
+
+                byte[] buff = new byte[BLOCK_SIZE
+                ];
+                System.arraycopy(data, pos, buff, 0, chunk);
+
+                disk.seek(DATA_START_OFFSET + blk * BLOCK_SIZE
+                );
+                disk.write(buff);
+
+                pos += chunk;
+                left -= chunk;
+                prevBlock = blk;
+            }
+
+            // update entry
+            entry.setFirstBlock((short) firstBlock);
+            entry.setFilesize((short) data.length);
+
+            disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
+            disk.write(entry.toBytes());
+
+        } finally {
+            globalLock.unlock();
+        }
+    }
+
+    // load all bytes of a file
+    public byte[] readFile(String name) throws Exception {
+        globalLock.lock();
+        try {
+            int slot = findSlotForFile(name);
+            if (slot == -1) {
+                throw new IllegalArgumentException("file not found: " + name);
+            }
+
+            FEntry entry = inodeTable[slot];
+            int size = entry.getFilesize();
+
+            if (size <= 0 || entry.getFirstBlock() < 0) {
+                return new byte[0];
+            }
+
+            byte[] out = new byte[size];
+            int copied = 0;
+            int blk = entry.getFirstBlock();
+
+            // follow the linked list of blocks
+            while (blk >= 0 && copied < size) {
+                disk.seek(DATA_START_OFFSET + blk * BLOCK_SIZE);
+                byte[] buff = new byte[BLOCK_SIZE];
+                disk.readFully(buff);
+                int part = size - copied;
+                if (part > BLOCK_SIZE) {
+                    part = BLOCK_SIZE ;
+                }
+
+                System.arraycopy(buff, 0, out, copied, part);
+                copied += part;
+
+                blk = fNodes[blk].getNext();
+            }
+
+            return out;
+
+        } finally {
+            globalLock.unlock();
+        }
+    }
+
+    // delete file and its blocks
+    public void deleteFile(String name) throws Exception {
+        globalLock.lock();
+        try {
+            int slot = findSlotForFile(name);
+            if (slot == -1) {
+                // nothing to delete
+                return;
+            }
+
+            FEntry entry = inodeTable[slot];
+
+            if (entry.getFirstBlock() >= 0) {
+                dropBlockChain(entry.getFirstBlock());
+            }
+
+            // reset this entry
+            FEntry empty = new FEntry("", (short) 0, (short) -1);
+            inodeTable[slot] = empty;
+            disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
+            disk.write(empty.toBytes());
+
+        } finally {
+            globalLock.unlock();
+        }
+    }
 }
