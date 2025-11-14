@@ -19,12 +19,7 @@ public class FileServer {
         this.port = port;
     }
 
-    public void start(){
-        try (ServerSocket serverSocket = new ServerSocket(12345)) {
-            System.out.println("Server started. Listening on port 12345...");
-
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
+    public void clientHandling(Socket clientSocket){
                 System.out.println("Handling client: " + clientSocket);
                 try (
                         BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
@@ -59,9 +54,27 @@ public class FileServer {
                     } catch (Exception e) {
                         // Ignore
                     }
+                    System.err.println("Closed connection " + clientSocket);
                 }
-            }
-        } catch (Exception e) {
+    }
+//multithreading
+    public void start(){
+         try (ServerSocket serverSocket = new ServerSocket(12345)) {
+            System.out.println("Server started. Listening on port 12345...");
+
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                System.out.println("Handling new client: " + clientSocket);
+                //new thread for each client
+                Thread Cthread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        clientHandling(clientSocket);
+                    }
+                });
+                Cthread.start();
+    }
+       } catch (Exception e) {
             e.printStackTrace();
             System.err.println("Could not start server on port " + port);
         }
