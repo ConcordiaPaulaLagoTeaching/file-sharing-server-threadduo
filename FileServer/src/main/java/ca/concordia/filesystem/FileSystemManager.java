@@ -34,6 +34,11 @@ public class FileSystemManager {
         FNODES_START = MAXFILES * FENTRY_SIZE; // FNodes start after FEntries
         DATA_START_OFFSET = METADATA_SIZE;
         
+         int minimumSize = METADATA_SIZE + (MAXBLOCKS * BLOCK_SIZE);
+        if (totalSize < minimumSize) {
+            throw new IllegalArgumentException("totalSize too small for filesystem metadata and data blocks. " +
+                    "Minimum required: " + minimumSize + " bytes, but got: " + totalSize + " bytes");
+        }
         try {
             this.disk = new RandomAccessFile(filename, "rw");
             // Validate requested total size is sufficient for metadata + data
@@ -125,7 +130,26 @@ public class FileSystemManager {
         System.out.println("Existing file system loaded");
     }   
 
-   
+    public String[] listFiles() {
+    // Count how many files exist
+    int fileCount = 0;
+    for (FEntry entry : inodeTable) {
+        if (entry != null && !entry.getFilename().isEmpty()) {
+            fileCount++;
+        }
+    }
+    
+    // Create array and populate with filenames
+    String[] files = new String[fileCount];
+    int index = 0;
+    for (FEntry entry : inodeTable) {
+        if (entry != null && !entry.getFilename().isEmpty()) {
+            files[index++] = entry.getFilename();
+        }
+    }
+    
+        return files;
+    }
     public void createFile(String fileName) throws Exception {
         // TODO
         throw new UnsupportedOperationException("Method not implemented yet.");
