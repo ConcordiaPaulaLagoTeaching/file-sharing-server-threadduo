@@ -8,11 +8,6 @@ import java.net.ServerSocket;
 import java.net.Socket;
 
 public class FileServer {
-    // rw lock for synchronization
-    private final Object ReadWritelock = new Object();
-    private int num_activereaders = 0;
-    private boolean InsideWriter = false;
-    private int writerWaiting = 0; // kept for completeness, not heavily used
 
     private FileSystemManager fsManager;
     private int port;
@@ -21,78 +16,56 @@ public class FileServer {
         this.fsManager = new FileSystemManager(fileSystemName, totalSize);
         this.port = port;
     }
-    // Readers and writers synchronization 
-    private void startRead() {
-        synchronized (ReadWritelock) {
-            // only block readers if writer is actively writing
-            while (InsideWriter) {
-                try { ReadWritelock.wait(); }
-                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-            }
-            num_activereaders++;
-        }
-    }
-
-    private void endRead() {
-        synchronized (ReadWritelock) {
-            num_activereaders--;
-            if (num_activereaders == 0) {
-                ReadWritelock.notifyAll();
-            }
-        }
-    }
-
-    private void startWrite() {
-        synchronized (ReadWritelock) {
-            writerWaiting++;
-            while (num_activereaders > 0 || InsideWriter) {
-                try { ReadWritelock.wait(); }
-                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-            }
-            writerWaiting--;
-            InsideWriter = true;
-        }
-    }
-
-    private void endWrite() {
-        synchronized (ReadWritelock) {
-            InsideWriter = false;
-            ReadWritelock.notifyAll();
-        }
-    }
 
     private void clientHandling(Socket clientSocket){
+        // no exception kills  thread
+        Thread.currentThread().setUncaughtExceptionHandler((t, e) -> {
+            System.err.println("Client handler crashed: " + e.getMessage());
+        });
+
         System.out.println("Handling client: " + clientSocket);
         try (
-                BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-                PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true)
+                BufferedReader reader =
+                        new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+                PrintWriter writer =
+                        new PrintWriter(clientSocket.getOutputStream(), true)
         ) {
             String line;
-            while ((line = reader.readLine()) != null) {
-                System.out.println("Received from client: " + line);
-
-                line = line.trim();
-                if (line.isEmpty()) {
-                    writer.println("ERROR");
-                    writer.flush();
-                    continue;
-                }
-
-                String[] parts = line.split(" ", 3);
-                String command = parts[0].toUpperCase();
-
+            // don't exit on errors
+            while (true) {
                 try {
+                    line = reader.readLine();
+                    // client disconnected 
+                    if (line == null) {
+                        writer.println("ERROR");
+                        writer.flush();
+                        continue;  
+                    }
+
+                    System.out.println("Received from client: " + line);
+
+                    line = line.trim();
+                    if (line.isEmpty()) {
+                        writer.println("ERROR");
+                        writer.flush();
+                        continue;
+                    }
+
+                    String[] parts = line.split(" ", 3);
+                    String command = parts[0].toUpperCase();
+
                     switch (command) {
                         case "CREATE":
                             if (parts.length < 2) {
                                 writer.println("ERROR");
                                 break;
                             }
-                            startWrite();
                             try {
                                 fsManager.createFile(parts[1]);
                                 writer.println("SUCCESS: File '" + parts[1] + "' created.");
-                            } finally { endWrite(); }
+                            } catch (Exception ex) {
+                                writer.println("ERROR");
+                            }
                             break;
 
                         // write 
@@ -101,11 +74,12 @@ public class FileServer {
                                 writer.println("ERROR");
                                 break;
                             }
-                            startWrite();
                             try {
                                 fsManager.writeFile(parts[1], parts[2].getBytes());
                                 writer.println("SUCCESS: wrote to '" + parts[1] + "'");
-                            } finally { endWrite(); }
+                            } catch (Exception ex) {
+                                writer.println("ERROR");
+                            }
                             break;
                         // read 
                         case "READ":
@@ -113,11 +87,12 @@ public class FileServer {
                                 writer.println("ERROR");
                                 break;
                             }
-                            startRead();
                             try {
                                 byte[] fileData = fsManager.readFile(parts[1]);
                                 writer.println("SUCCESS: " + new String(fileData));
-                            } finally { endRead(); }
+                            } catch (Exception ex) {
+                                writer.println("ERROR");
+                            }
                             break;
 
                         // delete a file
@@ -126,23 +101,25 @@ public class FileServer {
                                 writer.println("ERROR");
                                 break;
                             }
-                            startWrite();
                             try {
                                 fsManager.deleteFile(parts[1]);
                                 writer.println("SUCCESS: File '" + parts[1] + "' deleted.");
-                            } finally { endWrite(); }
+                            } catch (Exception ex) {
+                                writer.println("ERROR");
+                            }
                             break;
 
                         // list all files
                         case "LIST":
-                            startRead();
                             try {
                                 String[] files = fsManager.listFiles();
                                 if (files.length == 0)
                                     writer.println("SUCCESS: (no files)");
                                 else
                                     writer.println("SUCCESS: " + String.join(",", files));
-                            } finally { endRead(); }
+                            } catch (Exception ex) {
+                                writer.println("ERROR");
+                            }
                             break;
 
                         case "QUIT":
@@ -150,19 +127,22 @@ public class FileServer {
                             writer.flush();
                             return;
                         default:
+                            // malformed input alway responds "ERROR"
                             writer.println("ERROR");
                             break;
                     }
 
+                    writer.flush();
                 } catch (Exception ex) {
-                    // error handling 
+                    //don't close the connection on internal errors
                     writer.println("ERROR");
+                    writer.flush();
+                    // continue to next read instead of dying
+                    continue;
                 }
-
-                writer.flush();
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            System.err.println("Client thread error: " + e.getMessage());
         } finally {
             try { clientSocket.close(); } catch (Exception e) {}
             System.err.println("Closed connection " + clientSocket);
@@ -180,9 +160,9 @@ public class FileServer {
                 Cthread.start();
             }
         } catch (Exception e) {
-            e.printStackTrace();
             System.err.println("Could not start server on port " + port);
+            e.printStackTrace();
         }
     }
-
+    
 }
