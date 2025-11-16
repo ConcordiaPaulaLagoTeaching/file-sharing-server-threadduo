@@ -3,6 +3,7 @@ package ca.concordia.filesystem;
 import ca.concordia.filesystem.datastructures.FEntry;
 import ca.concordia.filesystem.datastructures.FNode;
 
+import java.io.File;
 import java.io.RandomAccessFile;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -10,16 +11,15 @@ public class FileSystemManager {
 
     private final int MAXFILES = 5;
     private final int MAXBLOCKS = 10;
-    private static FileSystemManager instance;
     private RandomAccessFile disk;
     private final ReentrantLock globalLock = new ReentrantLock();
 
     private static final int BLOCK_SIZE = 128;
 
     private FEntry[] inodeTable;
-    private FNode[] fNodes; // NEW: Array to track FNodes in memory
+    private FNode[] fNodes;
     private boolean[] freeBlockList;
-    
+
     // Layout calculations
     private final int FENTRY_SIZE = 15;
     private final int FNODE_SIZE = 8;
@@ -31,20 +31,22 @@ public class FileSystemManager {
     public FileSystemManager(String filename, int totalSize) {
         // Calculate disk layout
         METADATA_SIZE = (MAXFILES * FENTRY_SIZE) + (MAXBLOCKS * FNODE_SIZE);
-        FNODES_START = MAXFILES * FENTRY_SIZE; // FNodes start after FEntries
+        FNODES_START = MAXFILES * FENTRY_SIZE;
         DATA_START_OFFSET = METADATA_SIZE;
-        
-        int minimumSize = METADATA_SIZE;
-        if (totalSize < minimumSize) {
-            throw new IllegalArgumentException("totalSize too small for filesystem metadata and data blocks. " +
-                    "Minimum required: " + minimumSize + " bytes, but got: " + totalSize + " bytes");
-        }
+
+         File f = new File(filename);
+        boolean existed = f.exists();
+        long oldSize = existed ? f.length() : 0;
+
         try {
+            // Now open the file
             this.disk = new RandomAccessFile(filename, "rw");
-            // recreate if old test file has wrong size
-            java.io.File f = new java.io.File(filename);
-            if (f.exists() && f.length() != totalSize) {
+
+            // recreate if wrong size
+            if (existed && oldSize != totalSize && oldSize > 0) {
+                disk.close();
                 f.delete();
+                existed = false;
                 this.disk = new RandomAccessFile(filename, "rw");
                 disk.setLength(totalSize);
             }
@@ -52,121 +54,88 @@ public class FileSystemManager {
             this.inodeTable = new FEntry[MAXFILES];
             this.fNodes = new FNode[MAXBLOCKS]; // NEW
             this.freeBlockList = new boolean[MAXBLOCKS];
-            
-            // Check if file is new or existing
-            if (disk.length() == 0) {
-                // Make sure the file has the requested size
+
+            if (!existed || oldSize == 0) {
                 disk.setLength(totalSize);
                 System.out.println("Creating new file system...");
                 initializeNewFileSystem();
             } else {
                 if (disk.length() < METADATA_SIZE) {
-                    throw new IllegalStateException("Existing disk file too small to contain filesystem metadata.");
+                    throw new IllegalStateException("Existing disk too small.");
                 }
                 System.out.println("Loading existing file system...");
                 loadExistingFileSystem();
             }
-            
-            System.out.println("FileSystemManager initialized:");
-            System.out.println("  MAXFILES: " + MAXFILES + ", MAXBLOCKS: " + MAXBLOCKS);
-            System.out.println("  FEntries: 0 to " + (FNODES_START - 1));
-            System.out.println("  FNodes: " + FNODES_START + " to " + (DATA_START_OFFSET - 1));
-            System.out.println("  Data blocks: " + DATA_START_OFFSET + " onwards");
-            
+
         } catch (Exception e) {
-            e.printStackTrace();
             throw new RuntimeException("Failed to initialize FileSystemManager", e);
         }
-        // Set singleton instance (if desired)
-        instance = this;
     }
 
     private void initializeNewFileSystem() throws Exception {
         // Initialize all FEntries as empty
         for (int i = 0; i < MAXFILES; i++) {
-            FEntry emptyEntry = new FEntry("", (short)0, (short)-1);
-            inodeTable[i] = emptyEntry;
-            
-            // Write empty FEntry to disk
-            byte[] entryBytes = emptyEntry.toBytes();
-            disk.seek(FENTRIES_START + (i * FENTRY_SIZE));
-            disk.write(entryBytes);
+            FEntry empty = new FEntry("", (short)0, (short)-1);
+            inodeTable[i] = empty;
+
+            disk.seek(FENTRIES_START + i * FENTRY_SIZE);
+            disk.write(empty.toBytes());
         }
-        
-        // Initialize all FNodes as free (negative blockIndex)
+
+        // Initialize all FNodes as free 
         for (int i = 0; i < MAXBLOCKS; i++) {
-            FNode freeNode = new FNode(-(i + 1)); // Negative = free block
-            freeNode.setNext(-1);
-            fNodes[i] = freeNode;
+            FNode node = new FNode(-(i + 1));
+            node.setNext(-1);
+            fNodes[i] = node;
             freeBlockList[i] = true;
-            
-            // Write FNode to disk
-            byte[] nodeBytes = freeNode.toBytes();
-            disk.seek(FNODES_START + (i * FNODE_SIZE));
-            disk.write(nodeBytes);
+
+            disk.seek(FNODES_START + i * FNODE_SIZE);
+            disk.write(node.toBytes());
         }
-        
-        System.out.println("New file system created with " + MAXFILES + " file slots and " + MAXBLOCKS + " blocks");
     }
 
     private void loadExistingFileSystem() throws Exception {
     // Load FEntries from disk
-    for (int i = 0; i < MAXFILES; i++) {
-        disk.seek(FENTRIES_START + (i * FENTRY_SIZE));
-        byte[] entryData = new byte[FENTRY_SIZE];
-        disk.readFully(entryData);
-        inodeTable[i] = FEntry.fromBytes(entryData);
-    }
-    
+        for (int i = 0; i < MAXFILES; i++) {
+            disk.seek(FENTRIES_START + i * FENTRY_SIZE);
+            byte[] entry = new byte[FENTRY_SIZE];
+            disk.readFully(entry);
+            inodeTable[i] = FEntry.fromBytes(entry);
+        }
+
     // Load FNodes from disk and build free block list
-    for (int i = 0; i < MAXBLOCKS; i++) {
-        disk.seek(FNODES_START + (i * FNODE_SIZE));
-        byte[] nodeData = new byte[FNODE_SIZE];
-        disk.readFully(nodeData);
-        fNodes[i] = FNode.fromBytes(nodeData);
-        
+        for (int i = 0; i < MAXBLOCKS; i++) {
+            disk.seek(FNODES_START + i * FNODE_SIZE);
+            byte[] buff = new byte[FNODE_SIZE];
+            disk.readFully(buff);
+            fNodes[i] = FNode.fromBytes(buff);
+
         // Block is free if blockIndex is negative
-        freeBlockList[i] = (fNodes[i].getBlockIndex() < 0);
+            freeBlockList[i] = (fNodes[i].getBlockIndex() < 0);
+        }
     }
-    
-        System.out.println("Existing file system loaded");
-    }   
 
     public String[] listFiles() {
-    // Count how many files exist
-    int fileCount = 0;
-    for (FEntry entry : inodeTable) {
-        if (entry != null && !entry.getFilename().isEmpty()) {
-            fileCount++;
-        }
-    }
-    
-    // Create array and populate with filenames
-    String[] files = new String[fileCount];
-    int index = 0;
-    for (FEntry entry : inodeTable) {
-        if (entry != null && !entry.getFilename().isEmpty()) {
-            files[index++] = entry.getFilename();
-        }
-    }
-    
-        return files;
+        int count = 0;
+        for (FEntry e : inodeTable)
+            if (e != null && !e.getFilename().isEmpty()) count++;
+
+        String[] out = new String[count];
+        int idx = 0;
+        for (FEntry e : inodeTable)
+            if (e != null && !e.getFilename().isEmpty())
+                out[idx++] = e.getFilename();
+
+        return out;
     }
 
     public void createFile(String fileName) throws Exception {
-     if (fileName.length() > 11) {
-    throw new IllegalArgumentException("ERROR: filename too long");
-    }
-    
-        // Check if file already exists
-        for (FEntry entry : inodeTable) {
-        if (entry != null && fileName.equals(entry.getFilename())) {
-            System.out.println("File '" + fileName + "' already exists, skip create.");
-            return;
-        }
-    }
-    
-        // Find free FEntry slot
+        if (fileName.length() > 11)
+            throw new IllegalArgumentException("ERROR: filename too long");
+
+        for (FEntry e : inodeTable)
+            if (e != null && fileName.equals(e.getFilename())) return;
+
         int freeSlot = -1;
         for (int i = 0; i < MAXFILES; i++) {
             if (inodeTable[i] == null || inodeTable[i].getFilename().isEmpty()) {
@@ -174,32 +143,24 @@ public class FileSystemManager {
                 break;
             }
         }
-    
-        if (freeSlot == -1) {
-            throw new Exception("ERROR: no free file slots available");
-        }
-    
+
+        if (freeSlot == -1) throw new Exception("ERROR: no free file slots available");
+
         // Create new FEntry
         FEntry newEntry = new FEntry(fileName, (short)0, (short)-1);
         inodeTable[freeSlot] = newEntry;
-    
+
         // Write to disk
         disk.seek(FENTRIES_START + (freeSlot * FENTRY_SIZE));
         disk.write(newEntry.toBytes());
-    
-        System.out.println("Created file: '" + fileName + "' in slot " + freeSlot);
     }
 
      // find file by name in table
     private int findSlotForFile(String name) {
-        for (int i = 0; i < MAXFILES; i++) {
-            if (inodeTable[i] != null) {
-                if (name.equals(inodeTable[i].getFilename())) {
-                    return i;
-                }
-            }
-        }
-        return -1; // not found
+        for (int i = 0; i < MAXFILES; i++)
+            if (inodeTable[i] != null && name.equals(inodeTable[i].getFilename()))
+                return i;
+        return -1;
     }
 
     // get a free data block
@@ -225,12 +186,10 @@ public class FileSystemManager {
 
     // put block back in free list
     private void giveBackBlock(int idx) throws Exception {
-        if (idx < 0 || idx >= MAXBLOCKS) {
-            return;
-        }
+        if (idx < 0 || idx >= MAXBLOCKS) return;
 
         freeBlockList[idx] = true;
-        FNode n = new FNode(-(idx + 1));  // negative = free in this setup
+        FNode n = new FNode(-(idx + 1));
         n.setNext(-1);
         fNodes[idx] = n;
         disk.seek(FNODES_START + idx * FNODE_SIZE);
@@ -260,15 +219,13 @@ public class FileSystemManager {
 
             FEntry entry = inodeTable[slot];
 
-            // if file had blocks before, clear them first
-            if (entry.getFirstBlock() >= 0) {
+            if (entry.getFirstBlock() >= 0)
                 dropBlockChain(entry.getFirstBlock());
-            }
 
             // handle null data
             if (data == null || data.length == 0) {
-                entry.setFilesize((short) 0);
-                entry.setFirstBlock((short) -1);
+                entry.setFilesize((short)0);
+                entry.setFirstBlock((short)-1);
 
                 disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
                 disk.write(entry.toBytes());
@@ -277,47 +234,33 @@ public class FileSystemManager {
 
             int left = data.length;
             int pos = 0;
+            int first = -1;
+            int prev = -1;
 
-            int firstBlock = -1;
-            int prevBlock = -1;
-
-            // write file chunk by chunk in 128-byte blocks
             while (left > 0) {
                 int blk = grabFreeBlock();
+                if (first == -1) first = blk;
 
-                if (firstBlock == -1) {
-                    firstBlock = blk;
+                if (prev != -1) {
+                    fNodes[prev].setNext(blk);
+                    disk.seek(FNODES_START + prev * FNODE_SIZE);
+                    disk.write(fNodes[prev].toBytes());
                 }
 
-                if (prevBlock != -1) {
-                    fNodes[prevBlock].setNext(blk);
-                    disk.seek(FNODES_START + prevBlock * FNODE_SIZE);
-                    disk.write(fNodes[prevBlock].toBytes());
-                }
-
-                int chunk = left;
-                if (chunk > BLOCK_SIZE
-                ) {
-                    chunk = BLOCK_SIZE
-                    ;
-                }
-
-                byte[] buff = new byte[BLOCK_SIZE
-                ];
+                int chunk = Math.min(left, BLOCK_SIZE);
+                byte[] buff = new byte[BLOCK_SIZE];
                 System.arraycopy(data, pos, buff, 0, chunk);
 
-                disk.seek(DATA_START_OFFSET + blk * BLOCK_SIZE
-                );
+                disk.seek(DATA_START_OFFSET + blk * BLOCK_SIZE);
                 disk.write(buff);
 
-                pos += chunk;
                 left -= chunk;
-                prevBlock = blk;
+                pos += chunk;
+                prev = blk;
             }
 
-            // update entry
-            entry.setFirstBlock((short) firstBlock);
-            entry.setFilesize((short) data.length);
+            entry.setFirstBlock((short)first);
+            entry.setFilesize((short)data.length);
 
             disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
             disk.write(entry.toBytes());
@@ -332,16 +275,14 @@ public class FileSystemManager {
         globalLock.lock();
         try {
             int slot = findSlotForFile(name);
-            if (slot == -1) {
+            if (slot == -1)
                 throw new IllegalArgumentException("file not found: " + name);
-            }
 
             FEntry entry = inodeTable[slot];
             int size = entry.getFilesize();
 
-            if (size <= 0 || entry.getFirstBlock() < 0) {
+            if (size <= 0 || entry.getFirstBlock() < 0)
                 return new byte[0];
-            }
 
             byte[] out = new byte[size];
             int copied = 0;
@@ -352,11 +293,8 @@ public class FileSystemManager {
                 disk.seek(DATA_START_OFFSET + blk * BLOCK_SIZE);
                 byte[] buff = new byte[BLOCK_SIZE];
                 disk.readFully(buff);
-                int part = size - copied;
-                if (part > BLOCK_SIZE) {
-                    part = BLOCK_SIZE ;
-                }
 
+                int part = Math.min(size - copied, BLOCK_SIZE);
                 System.arraycopy(buff, 0, out, copied, part);
                 copied += part;
 
@@ -375,20 +313,16 @@ public class FileSystemManager {
         globalLock.lock();
         try {
             int slot = findSlotForFile(name);
-            if (slot == -1) {
-                // nothing to delete
-                return;
-            }
+            if (slot == -1) return;
 
             FEntry entry = inodeTable[slot];
 
-            if (entry.getFirstBlock() >= 0) {
+            if (entry.getFirstBlock() >= 0)
                 dropBlockChain(entry.getFirstBlock());
-            }
 
-            // reset this entry
-            FEntry empty = new FEntry("", (short) 0, (short) -1);
+            FEntry empty = new FEntry("", (short)0, (short)-1);
             inodeTable[slot] = empty;
+
             disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
             disk.write(empty.toBytes());
 
