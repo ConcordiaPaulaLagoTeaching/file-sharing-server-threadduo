@@ -1,38 +1,338 @@
 package ca.concordia.filesystem;
 
 import ca.concordia.filesystem.datastructures.FEntry;
+import ca.concordia.filesystem.datastructures.FNode;
 
+import java.io.File;
 import java.io.RandomAccessFile;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class FileSystemManager {
 
     private final int MAXFILES = 5;
     private final int MAXBLOCKS = 10;
-    private final static FileSystemManager instance;
-    private final RandomAccessFile disk;
-    private final ReentrantLock globalLock = new ReentrantLock();
+    private RandomAccessFile disk;
 
-    private static final int BLOCK_SIZE = 128; // Example block size
+    private static final int BLOCK_SIZE = 128;
 
-    private FEntry[] inodeTable; // Array of inodes
-    private boolean[] freeBlockList; // Bitmap for free blocks
+    private FEntry[] inodeTable;
+    private FNode[] fNodes;
+    private boolean[] freeBlockList;
+
+    // Layout calculations
+    private final int FENTRY_SIZE = 15;
+    private final int FNODE_SIZE = 8;
+    private final int METADATA_SIZE;
+    private final int DATA_START_OFFSET;
+    private final int FENTRIES_START = 0;
+    private final int FNODES_START;
+    // Rreaders writer lock for  synchronization
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock(true);
 
     public FileSystemManager(String filename, int totalSize) {
-        // Initialize the file system manager with a file
-        if(instance == null) {
-            //TODO Initialize the file system
+        // Calculate disk layout
+        METADATA_SIZE = (MAXFILES * FENTRY_SIZE) + (MAXBLOCKS * FNODE_SIZE);
+        FNODES_START = MAXFILES * FENTRY_SIZE;
+        DATA_START_OFFSET = METADATA_SIZE;
+        try {
+        File f = new File(filename);
+        boolean existed = f.exists();
+
+        // Initialize in-memory arrays
+        this.inodeTable = new FEntry[MAXFILES];
+        this.fNodes = new FNode[MAXBLOCKS];
+        this.freeBlockList = new boolean[MAXBLOCKS];
+
+        this.disk = new RandomAccessFile(filename, "rw");
+
+        if (!existed) {
+            // initialize new file system
+            disk.setLength(totalSize);
+            System.out.println("Creating new FS...");
+            initializeNewFileSystem();
         } else {
-            throw new IllegalStateException("FileSystemManager is already initialized.");
+            System.out.println("Loading existing FS...");
+            loadExistingFileSystem();   
         }
 
+    } catch (Exception e) {
+        throw new RuntimeException("Failed to initialize FileSystemManager", e);
+    }
+}
+
+    private void initializeNewFileSystem() throws Exception {
+        // Initialize all FEntries as empty
+        for (int i = 0; i < MAXFILES; i++) {
+            FEntry empty = new FEntry("", (short)0, (short)-1);
+            inodeTable[i] = empty;
+
+            disk.seek(FENTRIES_START + i * FENTRY_SIZE);
+            disk.write(empty.toBytes());
+        }
+
+        // Initialize all FNodes as free 
+        for (int i = 0; i < MAXBLOCKS; i++) {
+            FNode node = new FNode(-(i + 1));
+            node.setNext(-1);
+            fNodes[i] = node;
+            freeBlockList[i] = true;
+
+            disk.seek(FNODES_START + i * FNODE_SIZE);
+            disk.write(node.toBytes());
+        }
+    }
+
+    private void loadExistingFileSystem() throws Exception {
+    // Load FEntries from disk
+        for (int i = 0; i < MAXFILES; i++) {
+            disk.seek(FENTRIES_START + i * FENTRY_SIZE);
+            byte[] entry = new byte[FENTRY_SIZE];
+            disk.readFully(entry);
+            inodeTable[i] = FEntry.fromBytes(entry);
+        }
+
+    // load FNodes from disk and build free block list
+        for (int i = 0; i < MAXBLOCKS; i++) {
+            disk.seek(FNODES_START + i * FNODE_SIZE);
+            byte[] buff = new byte[FNODE_SIZE];
+            disk.readFully(buff);
+            fNodes[i] = FNode.fromBytes(buff);
+            freeBlockList[i] = (fNodes[i].getBlockIndex() < 0);
+        }
+    }
+
+    public String[] listFiles() {
+        rwLock.readLock().lock();
+        try {
+            int count = 0;
+            for (FEntry e : inodeTable)
+                if (e != null && !e.getFilename().isEmpty()) count++;
+
+            String[] out = new String[count];
+            int idx = 0;
+            for (FEntry e : inodeTable)
+                if (e != null && !e.getFilename().isEmpty())
+                    out[idx++] = e.getFilename();
+
+            return out;
+        } finally {
+            rwLock.readLock().unlock();
+        }
     }
 
     public void createFile(String fileName) throws Exception {
-        // TODO
-        throw new UnsupportedOperationException("Method not implemented yet.");
+        rwLock.writeLock().lock();
+        try {
+            if (fileName.length() > 11)
+                throw new IllegalArgumentException("ERROR: filename too long");
+
+            for (FEntry e : inodeTable)
+                if (e != null && fileName.equals(e.getFilename()))
+                    return;   
+
+            int freeSlot = -1;
+            for (int i = 0; i < MAXFILES; i++) {
+                if (inodeTable[i] == null || inodeTable[i].getFilename().isEmpty()) {
+                    freeSlot = i;
+                    break;
+                }
+            }
+
+            if (freeSlot == -1) throw new Exception("ERROR: no free file slots available");
+
+        // Create new FEntry
+            FEntry newEntry = new FEntry(fileName, (short)0, (short)-1);
+            inodeTable[freeSlot] = newEntry;
+
+        // Write to disk
+            disk.seek(FENTRIES_START + (freeSlot * FENTRY_SIZE));
+            disk.write(newEntry.toBytes());
+        } finally {
+            rwLock.writeLock().unlock();
+        }
     }
 
+     // find file by name in table
+    private int findSlotForFile(String name) {
+        for (int i = 0; i < MAXFILES; i++)
+            if (inodeTable[i] != null && name.equals(inodeTable[i].getFilename()))
+                return i;
+        return -1;
+    }
 
-    // TODO: Add readFile, writeFile and other required methods,
+    // get a free data block
+    private int grabFreeBlock() throws Exception {
+        for (int i = 0; i < MAXBLOCKS; i++) {
+            if (freeBlockList[i]) {
+                freeBlockList[i] = false;
+
+                // update node in memory
+                FNode n = new FNode(i);
+                n.setNext(-1);
+                fNodes[i] = n;
+
+                // and on disk
+                disk.seek(FNODES_START + i * FNODE_SIZE);
+                disk.write(n.toBytes());
+
+                return i;
+            }
+        }
+        throw new Exception("no more blocks");
+    }
+
+    // put block back in free list
+    private void giveBackBlock(int idx) throws Exception {
+        if (idx < 0 || idx >= MAXBLOCKS) return;
+
+        freeBlockList[idx] = true;
+        FNode n = new FNode(-(idx + 1));
+        n.setNext(-1);
+        fNodes[idx] = n;
+        disk.seek(FNODES_START + idx * FNODE_SIZE);
+        disk.write(n.toBytes());
+    }
+
+    // go through all linked blocks and free them
+    private void dropBlockChain(short start) throws Exception {
+        int curr = start;
+        while (curr >= 0) {
+            int next = fNodes[curr].getNext();
+            giveBackBlock(curr);
+            curr = next;
+        }
+    }
+
+    // write new content 
+    public void writeFile(String name, byte[] data) throws Exception {
+        rwLock.writeLock().lock();
+        try {
+            int slot = findSlotForFile(name);
+            if (slot == -1) {
+                // if file doesn’t exist, just create it
+                createFile(name); 
+                slot = findSlotForFile(name);
+            }
+
+            FEntry entry = inodeTable[slot];
+
+            if (entry.getFirstBlock() >= 0)
+                dropBlockChain(entry.getFirstBlock());
+
+            // handle null data
+            if (data == null || data.length == 0) {
+                entry.setFilesize((short)0);
+                entry.setFirstBlock((short)-1);
+
+                disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
+                disk.write(entry.toBytes());
+                return;
+            }
+
+            int left = data.length;
+            int pos = 0;
+            int first = -1;
+            int prev = -1;
+
+            while (left > 0) {
+                int blk = grabFreeBlock();
+                if (first == -1) first = blk;
+
+                if (prev != -1) {
+                    fNodes[prev].setNext(blk);
+                    disk.seek(FNODES_START + prev * FNODE_SIZE);
+                    disk.write(fNodes[prev].toBytes());
+                }
+
+                int chunk = Math.min(left, BLOCK_SIZE);
+                byte[] buff = new byte[BLOCK_SIZE];
+                System.arraycopy(data, pos, buff, 0, chunk);
+
+                disk.seek(DATA_START_OFFSET + blk * BLOCK_SIZE);
+                disk.write(buff);
+
+                left -= chunk;
+                pos += chunk;
+                prev = blk;
+            }
+
+            entry.setFirstBlock((short)first);
+            entry.setFilesize((short)data.length);
+
+            disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
+            disk.write(entry.toBytes());
+
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    // load all bytes of a file
+    public byte[] readFile(String name) throws Exception {
+        rwLock.readLock().lock();
+        try {
+            int slot = findSlotForFile(name);
+            if (slot == -1)
+                throw new IllegalArgumentException("ERROR: file '" + name + "' does not exist");
+
+            FEntry entry = inodeTable[slot];
+            int size = entry.getFilesize();
+
+            if (size <= 0 || entry.getFirstBlock() < 0)
+                return new byte[0];
+
+            byte[] out = new byte[size];
+            int copied = 0;
+            int blk = entry.getFirstBlock();
+
+            // follow the linked list of blocks
+            while (blk >= 0 && copied < size) {
+                disk.seek(DATA_START_OFFSET + blk * BLOCK_SIZE);
+                byte[] buff = new byte[BLOCK_SIZE];
+                disk.readFully(buff);
+
+                int part = Math.min(size - copied, BLOCK_SIZE);
+                System.arraycopy(buff, 0, out, copied, part);
+                copied += part;
+
+                blk = fNodes[blk].getNext();
+            }
+
+            return out;
+
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    // delete file and its blocks
+    public void deleteFile(String name) throws Exception {
+        rwLock.writeLock().lock();
+        try {
+            int slot = findSlotForFile(name);
+            if (slot == -1)
+                throw new Exception("ERROR: file '" + name + "' does not exist");
+
+            FEntry entry = inodeTable[slot];
+
+            if (entry.getFirstBlock() >= 0)
+                dropBlockChain(entry.getFirstBlock());
+
+            FEntry empty = new FEntry("", (short)0, (short)-1);
+            inodeTable[slot] = empty;
+
+            disk.seek(FENTRIES_START + slot * FENTRY_SIZE);
+            disk.write(empty.toBytes());
+
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+    // for ServerRestartPersistence test
+    public void close() {
+        try {
+            if (disk != null) disk.close();
+        } catch (Exception ignored) {}
+    }
 }

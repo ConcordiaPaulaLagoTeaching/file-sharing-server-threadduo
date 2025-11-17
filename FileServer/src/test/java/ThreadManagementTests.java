@@ -55,7 +55,7 @@ public class ThreadManagementTests {
         ClientRunner.send("WRITE shared hello");
 
         ExecutorService pool = Executors.newFixedThreadPool(10);
-        CountDownLatch latch = new CountDownLatch(10);
+        CountDownLatch latch = new CountDownLatch(6);
 
         // Start readers
         for (int i = 0; i < 5; i++) {
